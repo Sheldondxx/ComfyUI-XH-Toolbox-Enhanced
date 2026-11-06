@@ -110,6 +110,11 @@ from .py.video_load import (
     NODE_DISPLAY_NAME_MAPPINGS as _LOAD_DISPLAY_NAME_MAPPINGS,
 )
 
+from .py.video_label_node import (
+    NODE_CLASS_MAPPINGS as _VLABEL_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as _VLABEL_DISPLAY_NAME_MAPPINGS,
+)
+
 # 2026-10-24 新增（复刻 comfyui-easy-media 的 Compare Videos，多路化 + 官方 getter）：
 #   · 🎬XH-视频对比  (XHCompareVideos)  多路视频（≤4）同步对比：网格同播 / 单看 / 两两滑块
 # 用 try 包住：本模块出问题只少这 1 个节点，不影响 image_tools 其余节点。
@@ -174,6 +179,7 @@ NODE_CLASS_MAPPINGS = {
     **_BG_CLASS_MAPPINGS,
     **_CMP_CLASS_MAPPINGS,
     **_VCMP_CLASS_MAPPINGS,
+    **_VLABEL_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -192,6 +198,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **_BG_DISPLAY_NAME_MAPPINGS,
     **_CMP_DISPLAY_NAME_MAPPINGS,
     **_VCMP_DISPLAY_NAME_MAPPINGS,
+    **_VLABEL_DISPLAY_NAME_MAPPINGS,
 }
 
 # 让 ComfyUI 加载 web/ 下的前端扩展（中/EN 语言切换按钮 + 参数/端口标签本地化 + 动态输入口）

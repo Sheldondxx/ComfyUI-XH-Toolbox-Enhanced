@@ -1412,7 +1412,10 @@ function fixSavedValues(node, saved) {
     const named = saved.widgets_values_named;
     if (named && typeof named === "object") {
         for (const w of real) {
-            if (!(w.name in named)) continue;
+            if (!(w.name in named)) {
+                if (["start_sec", "duration", "start_frame", "frame_count"].includes(w.name)) w.value = 0;
+                continue;
+            }
             const v = named[w.name];
             if (v === undefined) continue;
             if (w.type === "combo" && Array.isArray(w.options && w.options.values)
@@ -1429,6 +1432,13 @@ function fixSavedValues(node, saved) {
     const vals = saved.widgets_values;
     if (!Array.isArray(vals) || !vals.length) return;
     const arr = vals.filter((v) => !isBlank(v));
+    if (arr.length === 7) {
+        const names = ["video", "force_rate", "custom_width", "custom_height",
+            "frame_load_cap", "skip_first_frames", "select_every_nth"];
+        const legacy = Object.fromEntries(names.map((name, i) => [name, arr[i]]));
+        fixSavedValues(node, { widgets_values_named: legacy });
+        return;
+    }
     if (arr.length !== real.length) return;
     real.forEach((w, i) => {
         let v = arr[i];
