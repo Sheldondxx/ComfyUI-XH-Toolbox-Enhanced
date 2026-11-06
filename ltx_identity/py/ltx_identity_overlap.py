@@ -1,0 +1,978 @@
+"""🔁XH-LTX锁脸 · LTX-2.3 / 2.5 身份锁定（overlap / st_drc / strata 参考布局）
+
+本文件是 bfsnodes 'LTXIdentityOverlapConditioning' 的 XH 复刻版。
+算法与原版「逐字节一致」（没有改动任何计算逻辑），只做了三件事：
+  1) 下拉选项写成「中文 (english)」、tooltip 改中文优先 —— 界面能看懂了；
+  2) 分类 / 显示名改成 XH 风格（🔁XH/Identity · 🔒XH-LTX锁脸）；
+  3) 加 _xh_norm() 把双语选项值收敛回英文原值 —— 旧工作流存档照常工作。
+
+原版文件 bfsnodes/ltx_identity_overlap.py 保持原样不动，可随时对照 / 回滚。
+算法的原始说明如下：
+
+LTX-2.3/2.5 Identity OVERLAP — replica of ltx-trainer's overlap+source_phase reference.
+
+Unlike the append_keyframe path (which makes the ref an I2V first-frame), this injects the
+reference latent as SEPARATE tokens using the trainer's overlap/source-phase contract. The
+reference-only temporal offset can move those positions before frame zero to reduce learned
+frame-0 composition leakage; set it to 0 for the exact trainer overlap grid. The ref tokens
+remain clean (timestep 0), attend to the target in self-attention, and are sliced off the
+output (never rendered).
+
+Model patch (installed idempotently on the LTX av_model), matching LTXBaseModel._forward:
+  1) _process_input  : append ref video tokens (patchified ref latent) with overlap positions;
+  2) _prepare_positional_embeddings : rotate the ref tokens' RoPE freqs by source_phase;
+  3) _prepare_timestep : give the ref tokens clean (0) timestep;
+  4) _process_output : trim the ref tokens before unpatchify.
+Plus the ArcFace IdentityProjector tokens on the text context (as trained).
+
+Load the matching LoRA on MODEL first. Requires insightface + buffalo_l (ArcFace, CPU).
+Set LTX_IDOVERLAP_DEBUG=1 to log shapes at each patch point for iteration.
+"""
+import functools
+import logging
+import os
+import types
+import weakref
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from safetensors.torch import load_file
+
+from .reference_temporal_offset import (
+    DEFAULT_REFERENCE_TEMPORAL_OFFSET_LATENTS,
+    reference_temporal_offset_input,
+    reference_temporal_pixel_offset,
+    shift_reference_temporal_positions,
+)
+
+log = logging.getLogger("XH-LTXIdentity")
+_USE_GPU = os.environ.get("LTX_IDPROJ_ARCFACE_GPU", "0") == "1"
+_FACE_APP = None
+
+
+# ---------------------------------------------------------------------------
+# 🔁XH 双语选项值规范化
+# 下拉选项写成了「中文 (english)」，但内部逻辑一律按英文原值判断。
+# 这里把两种写法都收敛成英文原值 —— 旧工作流存档里存的纯英文值也照样工作。
+# ⚠️ canon 必须「长词在前」：match_target_letterbox 含 match_target 子串。
+# ---------------------------------------------------------------------------
+_XH_REF_RESIZE_MODES = ("match_target_letterbox", "native_resolution", "match_target")
+_XH_CROP_ANCHORS = ("center", "top", "bottom", "left", "right")
+_XH_LAYOUTS = ("st_drc", "strata", "sidecar", "overlap")
+
+
+def _xh_norm(value, canon):
+    """把「中文 (english)」双语选项值规范化回英文原值（兼容旧存档的纯英文值）。"""
+    s = str(value if value is not None else "")
+    for key in canon:
+        if key in s:
+            return key
+    return canon[-1]
+
+
+def _shape(x):
+    """Readable shape/structure of tensors, lists, tuples, CompressedTimestep, etc."""
+    try:
+        if hasattr(x, "shape"):
+            return f"T{tuple(x.shape)}"
+        if isinstance(x, (list, tuple)):
+            return f"{type(x).__name__}[{', '.join(_shape(i) for i in x)}]"
+        return type(x).__name__
+    except Exception:
+        return "?"
+
+
+# Per-step debug logging. Off by default; toggled by the node's `debug_log` input
+# (env var LTX_IDOVERLAP_DEBUG=1 sets the initial value).
+_DEBUG_ENABLED = os.environ.get("LTX_IDOVERLAP_DEBUG", "0") == "1"
+
+
+def _dbg(*a):
+    if _DEBUG_ENABLED:
+        print("[LTXIdOverlap] " + " ".join(str(x) for x in a), flush=True)
+
+
+# ---------------- ArcFace + projector (same as the other nodes) ----------------
+def _get_face_app():
+    global _FACE_APP
+    if _FACE_APP is None:
+        from insightface.app import FaceAnalysis
+        providers = (["CUDAExecutionProvider", "CPUExecutionProvider"] if _USE_GPU else ["CPUExecutionProvider"])
+        app = FaceAnalysis(name="buffalo_l", providers=providers)
+        app.prepare(ctx_id=0 if _USE_GPU else -1, det_size=(640, 640))
+        _FACE_APP = app
+    return _FACE_APP
+
+
+class IdentityProjector(nn.Module):
+    def __init__(self, in_dim=512, context_dim=4096, num_tokens=4, proj=None):
+        super().__init__()
+        self.in_dim = in_dim; self.context_dim = context_dim; self.num_tokens = num_tokens
+        # `proj` is built from the checkpoint (variable depth); fallback = original 2-linear MLP.
+        self.proj = proj if proj is not None else nn.Sequential(
+            nn.Linear(in_dim, 1024), nn.GELU(), nn.Linear(1024, num_tokens * context_dim))
+        self.norm = nn.LayerNorm(context_dim)
+
+    def forward(self, e):
+        return self.norm(self.proj(e).reshape(-1, self.num_tokens, self.context_dim))
+
+
+def _load_projector(path, device):
+    """Load an IdentityProjector of ANY depth by rebuilding proj.N Linears from the state_dict
+    (old = 2 linears proj.0/proj.2; new enhanced = 3 linears proj.0/proj.2/proj.4, 16 tokens)."""
+    sd = load_file(path)
+    context_dim = sd["norm.weight"].shape[0]
+    # collect Linear layers in order (proj.<idx>.weight), with GELU between them
+    idxs = sorted({int(k.split(".")[1]) for k in sd if k.startswith("proj.") and k.endswith(".weight")})
+    layers = []
+    for j, i in enumerate(idxs):
+        w = sd[f"proj.{i}.weight"]
+        layers.append(nn.Linear(w.shape[1], w.shape[0]))
+        if j < len(idxs) - 1:
+            layers.append(nn.GELU())
+    proj = nn.Sequential(*layers)
+    in_dim = sd["proj.0.weight"].shape[1]
+    num_tokens = sd[f"proj.{idxs[-1]}.weight"].shape[0] // context_dim
+    # Sequential indices must match the state_dict (Linear at even positions, GELU odd) — they do.
+    p = IdentityProjector(in_dim=in_dim, context_dim=context_dim, num_tokens=num_tokens, proj=proj)
+    p.load_state_dict(sd)
+    log.info("IdentityProjector loaded: %d tokens, %d Linear layers", num_tokens, len(idxs))
+    return p.to(device=device, dtype=torch.float32).eval()
+
+
+def _arcface_embed(image_bhwc, mode="auto_adjust"):
+    """Return the ArcFace embedding, or None if disabled / no face found.
+    mode: 'as_is' (detect on the image only), 'auto_adjust' (retry with border-pad
+    zoom-out + upscale when detection fails), 'disable' (skip ArcFace entirely).
+    """
+    if mode == "disable":
+        return None
+    import cv2
+    app = _get_face_app()
+    img = np.ascontiguousarray((np.clip(image_bhwc[0].detach().cpu().numpy(), 0.0, 1.0) * 255.0).astype(np.uint8)[:, :, ::-1])
+    attempts = [img]
+    if mode == "auto_adjust":
+        h, w = img.shape[:2]
+        pad = int(0.4 * max(h, w))                                   # zoom-out: face may fill the frame
+        attempts.append(cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REPLICATE))
+        attempts.append(cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC))  # upscale small faces
+        attempts.append(cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA))   # downscale huge faces
+    for a in attempts:
+        faces = app.get(a)
+        if faces:
+            f = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+            return torch.from_numpy(f.normed_embedding.astype(np.float32))
+    return None
+
+
+def _append_ctx_tokens(conditioning, tokens):
+    out = []
+    for ce, cd in conditioning:
+        t = tokens.to(device=ce.device, dtype=ce.dtype)
+        if t.shape[0] != ce.shape[0]:
+            t = t.expand(ce.shape[0], -1, -1)
+        if t.shape[-1] < ce.shape[-1]:
+            t = F.pad(t, (0, ce.shape[-1] - t.shape[-1]))
+        elif t.shape[-1] > ce.shape[-1]:
+            t = t[..., :ce.shape[-1]]
+        nd = cd.copy()
+        am = nd.get("attention_mask")
+        if am is not None:
+            nd["attention_mask"] = torch.cat([am, torch.ones((*am.shape[:-1], t.shape[1]), device=am.device, dtype=am.dtype)], dim=-1)
+        out.append([torch.cat([ce, t], dim=1), nd])
+    return out
+
+
+# ---------------- source_phase RoPE (port of ltx_core rope.apply_segment_phase) ----------------
+def _rotate_ref_block(pe, start, length, seg_value, theta=10000.0):
+    """Rotate RoPE freqs of tokens [start:start+length] by phase = seg_value * theta^(-d/L).
+    One reference block's own token range gets its own seg_value (source_id*phase_scale) --
+    callers loop this once per stacked reference so each keeps its own RoPE phase tag. With a
+    single reference (the common case), this is exactly the old "last ref_len tokens" rotation.
+
+    Two upstream pe formats, detected at runtime (ComfyUI changed this in 2026-07):
+    - fused matrix (current): pe = (rotation_matrix, split_mode_bool); rotation_matrix shape
+      [B, T, num_heads, L, 2, 2], one true 2x2 rotation matrix per (batch, token, head, freq).
+      We compose an additional phase rotation via matmul -- 2D rotation matrices commute, so
+      left/right composition order doesn't matter: R(seg*rate) @ R(existing) == R(existing+seg*rate).
+    - separate cos/sin (pre-2026-07 ComfyUI): pe = (cos, sin, [split_flag]), each [..., T, L].
+    """
+    if length <= 0 or seg_value == 0.0:
+        return pe
+    first = pe[0]
+    if torch.is_tensor(first) and first.dim() >= 3 and first.shape[-2:] == (2, 2):
+        # fused rotation-matrix format: pe = (matrix[B,T,H,L,2,2], split_mode)
+        matrix = first
+        rest = tuple(pe[1:])
+        L = matrix.shape[-3]
+        d = torch.arange(L, device=matrix.device, dtype=torch.float32)
+        rate = theta ** (-d / float(L))
+        phase = seg_value * rate                          # [L]
+        cp = phase.cos().to(matrix.dtype)
+        sp = phase.sin().to(matrix.dtype)
+        r_phase = torch.stack(
+            (torch.stack((cp, -sp), dim=-1), torch.stack((sp, cp), dim=-1)), dim=-2
+        )                                                   # [L, 2, 2]
+        sub = matrix[:, start:start + length]                # [B, length, H, L, 2, 2]
+        rotated = torch.matmul(r_phase, sub)
+        matrix = matrix.clone()
+        matrix[:, start:start + length] = rotated
+        _dbg("rotate ref block (matrix): L", L, "start", start, "length", length, "seg", seg_value)
+        return (matrix, *rest)
+
+    # legacy separate cos/sin format
+    cos, sin = pe[0], pe[1]
+    rest = tuple(pe[2:])
+    L = cos.shape[-1]
+    d = torch.arange(L, device=cos.device, dtype=torch.float32)
+    rate = theta ** (-d / float(L))                      # (0,1], high-freq carries the tag
+    phase = (seg_value * rate)                           # [L]
+    pc = phase.cos().to(cos.dtype); ps = phase.sin().to(sin.dtype)
+    # index the token axis (=-2)
+    idx = [slice(None)] * cos.dim()
+    idx[-2] = slice(start, start + length)
+    idx = tuple(idx)
+    c0, s0 = cos[idx], sin[idx]
+    cos = cos.clone(); sin = sin.clone()
+    cos[idx] = c0 * pc - s0 * ps
+    sin[idx] = s0 * pc + c0 * ps
+    _dbg("rotate ref block: L", L, "start", start, "length", length, "seg", seg_value)
+    return (cos, sin, *rest)
+
+
+# ---------------- model patches (idempotent, on the av_model instance) ----------------
+def _find_ltxv(model):
+    m = getattr(model, "model", model)
+    m = getattr(m, "diffusion_model", m)
+    return m
+
+
+def _detect_ltx_version(ltxv):
+    """Detect the LTX generation from a model-native checkpoint parameter.
+
+    LTX-2.5 introduces ``keyframes_abs_pos_embedding``. ComfyUI detects the same
+    state-dict key when constructing the model and exposes both the feature flag
+    and the parameter on LTXBaseModel. Avoid filename-based detection because a
+    user can rename or quantize a checkpoint without changing its architecture.
+    """
+    if bool(getattr(ltxv, "use_keyframes_abs_pos_embedding", False)):
+        return "2.5"
+    if getattr(ltxv, "keyframes_abs_pos_embedding", None) is not None:
+        return "2.5"
+    return "2.3/legacy"
+
+
+def _letterbox_resize(ref_img, tgt_w, tgt_h, pad_value=1.0):
+    """Resize `ref_img` ([B,H,W,C]) to fit ENTIRELY inside tgt_w x tgt_h, preserving its own
+    aspect ratio (no crop, no distortion), padding the leftover space with `pad_value`
+    (default white, matching the composite sheet's own white background). Unlike
+    common_upscale(..., crop="center") -- which center-crops to the target aspect ratio
+    BEFORE resizing, silently discarding whatever isn't in the middle of the source image --
+    this never discards any pixel of the reference."""
+    import comfy.utils
+    x = ref_img.movedim(-1, 1)  # [B,C,H,W]
+    _, _, src_h, src_w = x.shape
+    scale = min(tgt_w / src_w, tgt_h / src_h)
+    new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+    resized = comfy.utils.common_upscale(x, new_w, new_h, "bilinear", "disabled")
+    pad_w, pad_h = tgt_w - new_w, tgt_h - new_h
+    left, top = pad_w // 2, pad_h // 2
+    right, bottom = pad_w - left, pad_h - top
+    padded = F.pad(resized, (left, right, top, bottom), mode="constant", value=pad_value)
+    return padded.movedim(1, -1)
+
+
+def _anchored_crop_resize(ref_img, tgt_w, tgt_h, anchor="center"):
+    """Like comfy.utils.common_upscale(..., crop="center") but with a configurable anchor
+    for WHICH part of the source survives the crop when the aspect ratio doesn't match,
+    instead of always the exact center (e.g. anchor="top" keeps the top of the sheet --
+    useful when the face closeup panel isn't centered in your layout). Returns the
+    cropped+resized image plus the crop box (x0, y0, crop_w, crop_h) in SOURCE pixel
+    coords, for drawing a preview overlay."""
+    import comfy.utils
+    x_img = ref_img.movedim(-1, 1)  # [B,C,H,W]
+    _, _, old_h, old_w = x_img.shape
+    old_aspect = old_w / old_h
+    new_aspect = tgt_w / tgt_h
+    x0, y0, crop_w, crop_h = 0, 0, old_w, old_h
+    if old_aspect > new_aspect:
+        # source wider than target -- crop width
+        crop_w = max(1, round(old_w * (new_aspect / old_aspect)))
+        if anchor == "left":
+            x0 = 0
+        elif anchor == "right":
+            x0 = old_w - crop_w
+        else:
+            x0 = (old_w - crop_w) // 2
+    elif old_aspect < new_aspect:
+        # source taller than target -- crop height
+        crop_h = max(1, round(old_h * (old_aspect / new_aspect)))
+        if anchor == "top":
+            y0 = 0
+        elif anchor == "bottom":
+            y0 = old_h - crop_h
+        else:
+            y0 = (old_h - crop_h) // 2
+    cropped = x_img[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+    out = comfy.utils.common_upscale(cropped, tgt_w, tgt_h, "bilinear", "disabled")
+    return out.movedim(1, -1), (x0, y0, crop_w, crop_h)
+
+
+def _draw_crop_overlay(ref_img, box):
+    """Original reference with a green rectangle around the region that SURVIVES the crop
+    (everything outside the rectangle gets discarded). box = (x0, y0, w, h) in source pixel
+    coords, e.g. from _anchored_crop_resize. If box covers the whole image (no crop, as in
+    letterbox/native_resolution modes), the rectangle just outlines the full frame."""
+    from PIL import Image, ImageDraw
+    x0, y0, cw, ch = box
+    arr = (ref_img[0, :, :, :3].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    pil = Image.fromarray(arr).convert("RGB")
+    draw = ImageDraw.Draw(pil)
+    w, h = pil.size
+    lw = max(2, min(w, h) // 150)
+    draw.rectangle([x0, y0, x0 + cw - 1, y0 + ch - 1], outline=(0, 255, 0), width=lw)
+    out = torch.from_numpy(np.array(pil).astype(np.float32) / 255.0).unsqueeze(0)
+    return out
+
+
+# Seconds reserved per numbered strata slot -- MUST match ltx_trainer's
+# training_strategies.tass.STRATA_SLOT_WIDTH for a strata-trained checkpoint's RoPE
+# convention to line up at inference. Slot 0 (1st ref in the batch) lands at
+# target_max_t + this value, slot 1 (2nd ref) at target_max_t + 2*this value, etc. --
+# dynamic/target-relative, same as st_drc's own shift, so it stays correct for whatever
+# video length is actually generated.
+# CHANGED 2026-07-18 (0.5 -> 1.5): 0.5 caused a real slot0/slot1 collision -- a single-frame
+# reference image (fps=1.0 convention) spans a full 1.0-SECOND range on the T axis, not a
+# point, so width=0.5 let adjacent slots overlap. See tass.py's STRATA_SLOT_WIDTH docstring.
+# Any checkpoint trained before this fix (e.g. phantom_stacked_r128/_p2) learned under the
+# collided geometry; continuing training from one now adapts to the corrected spacing.
+STRATA_SLOT_WIDTH = 1.5
+
+
+def _tass_axis_stats(positions):
+    """Per-axis (min, max), reduced over every dimension EXCEPT the T/H/W one.
+
+    Two coordinate shapes reach this node: older LTX builds hand out one corner per token,
+    [B, 3 (T/H/W), N], while LTX-2.5 hands out patch bounds, [B, 3, N, 2] -- the same shape
+    the trainer works in. Reducing over "everything but the axis" is correct for both, and
+    keeps a patch's two bounds shifted by the SAME amount instead of by their own separate
+    minima (which would squeeze the span).
+
+    The batch is reduced too. Layouts run before the reference tokens are expanded to the CFG
+    batch, so target_positions can be [2, ...] while the reference is still [1, ...]; cond and
+    uncond share one geometry, so a batch-wide min/max is the same number either way and
+    broadcasts into whichever side is batch-1.
+    """
+    dims = (0,) + tuple(range(2, positions.dim()))
+    return positions.amin(dim=dims, keepdim=True), positions.amax(dim=dims, keepdim=True)
+
+
+def _apply_tass_layout(reference_positions, target_positions, layout: str, strata_start: float | None = None,
+                       sidecar_margin_pixels: float = 0.0, use_middle_indices_grid: bool = True):
+    """Place reference pixel-coords in a non-overlapping TASS region -- mirrors
+    ltx_core.conditioning.reference_layout.apply_reference_layout (kept in sync manually since
+    this node can't import the trainer package). Handles both coordinate shapes ComfyUI emits;
+    see _tass_axis_stats.
+    layout='overlap' returns the input unchanged.
+    layout='st_drc' shifts every axis (T, H, W) past the target's own extent.
+    layout='strata' shifts ONLY the T axis to an absolute band start (`strata_start`, in the
+    same raw pixel/frame units as `reference_positions` -- caller converts from seconds using
+    the model's frame_rate), leaving H/W overlapping the target -- see STRATA_SLOT_WIDTH.
+    layout='sidecar' places the reference BESIDE the target on the W axis, vertically centred on
+    it, and stretches its T span to cover the target's whole clip -- so the reference is present
+    for every frame instead of sitting at one instant. This is the layout the replace_refedit
+    recipe validated for an object reference.
+    """
+    if layout == "overlap":
+        return reference_positions
+    # ComfyUI's pixel coords are int64 (latent corners times integer VAE scale factors), while
+    # centring and midpoints are inherently half-pixel maths -- an in-place += of a float shift
+    # into a Long tensor just raises "result type Float can't be cast to the desired output
+    # type Long". Compute in float and round back on the way out, so callers keep the dtype
+    # they passed in (the caller casts to the target grid's dtype when concatenating, and a
+    # cast truncates where rounding is what we want).
+    coordinate_dtype = reference_positions.dtype
+    if not reference_positions.is_floating_point():
+        reference_positions = reference_positions.to(torch.float32)
+    if not target_positions.is_floating_point():
+        target_positions = target_positions.to(torch.float32)
+
+    def _restore(shifted):
+        if shifted.dtype == coordinate_dtype:
+            return shifted
+        return shifted.round().to(coordinate_dtype)
+
+    target_min, target_extent = _tass_axis_stats(target_positions)
+    reference_origin, reference_extent = _tass_axis_stats(reference_positions)
+    if layout == "st_drc":
+        return _restore(reference_positions + (target_extent - reference_origin))
+    if layout == "strata":
+        if strata_start is None:
+            raise ValueError("layout='strata' requires strata_start")
+        shifted = reference_positions.clone()
+        shifted[:, 0:1, ...] += strata_start - reference_origin[:, 0:1, ...]
+        return _restore(shifted)
+    if layout == "sidecar":
+        if reference_positions.shape[1] < 3:
+            raise ValueError(
+                f"layout='sidecar' expects at least 3 coordinate axes, got {reference_positions.shape[1]}"
+            )
+        shifted = reference_positions.clone()
+        # H: centraliza a referencia na altura do alvo
+        target_center_h = (target_min[:, 1:2, ...] + target_extent[:, 1:2, ...]) * 0.5
+        reference_center_h = (reference_origin[:, 1:2, ...] + reference_extent[:, 1:2, ...]) * 0.5
+        shifted[:, 1:2, ...] += target_center_h - reference_center_h
+        # W: desloca para a direita do alvo, mais a margem
+        shifted[:, 2:3, ...] += (
+            target_extent[:, 2:3, ...] + float(sidecar_margin_pixels) - reference_origin[:, 2:3, ...]
+        )
+        # T: a referencia cobre todo o intervalo do alvo. O trainer escreve o par
+        # (inicio, fim) = (t_min, t_max), e o modelo o colapsa num unico numero por token --
+        # de duas maneiras diferentes, e e por isso que aqui tem um `if`:
+        #   use_middle_indices_grid=True  (2.5, e qualquer 2.3 cujo metadata declare) -> (inicio+fim)/2
+        #   use_middle_indices_grid=False (2.3 nos checkpoints antigos)                -> so o inicio
+        # Escrever (t_min, t_max) nos dois casos poria a referencia no MEIO do clipe no 2.5 e no
+        # FRAME 0 no 2.3 -- placements diferentes para o mesmo LoRA. Escrever o ponto medio nos
+        # dois bounds da a mesma posicao efetiva sob qualquer uma das regras.
+        t_min = target_min[:, 0, 0, 0] if target_min.dim() == 4 else target_min[:, 0, 0]
+        t_max = target_extent[:, 0, 0, 0] if target_extent.dim() == 4 else target_extent[:, 0, 0]
+        if shifted.dim() == 4 and use_middle_indices_grid:
+            shifted[:, 0, :, 0] = t_min
+            shifted[:, 0, :, 1] = t_max
+        elif shifted.dim() == 4:
+            shifted[:, 0, :, :] = ((t_min + t_max) * 0.5).unsqueeze(-1)
+        else:
+            # Coordenadas legadas [B, 3, N]: um canto por token, lido direto pelo RoPE.
+            shifted[:, 0, :] = (t_min + t_max) * 0.5
+        return _restore(shifted)
+    raise ValueError(f"Unsupported TASS layout {layout!r}")
+
+
+def _unbound(obj, name):
+    """The plain function behind `obj.name`, so closures never pin the instance.
+
+    A bound method carries a strong reference to its instance; captured inside the patch closures
+    below it would keep the model alive through its own __dict__ (see _bind_weak).
+    """
+    function = getattr(type(obj), name, None)
+    if function is not None:
+        return function
+    attribute = getattr(obj, name, None)
+    if attribute is None:
+        return None
+    # Dynamically assigned (already patched by another node): fall back to its underlying
+    # function when there is one, otherwise wrap the bound callable and accept the reference.
+    return getattr(attribute, "__func__", None) or (lambda _self, *a, **k: attribute(*a, **k))
+
+
+def _bind_weak(function, instance):
+    """Install-ready callable with a method's signature but no reference cycle.
+
+    `instance._x = types.MethodType(fn, instance)` makes instance -> __dict__ -> method ->
+    instance, a cycle only a full collection can break. ComfyUI holds a weakref to the model and,
+    finding it alive after a run, logs "memory leak with model LTXAV" and forces a full gc every
+    execution -- which is what makes repeated runs progressively slower (issue #9). Resolving the
+    instance from a weakref at call time keeps the patch working with none of that.
+    """
+    reference = weakref.ref(instance)
+
+    @functools.wraps(function)
+    def patched(*args, **kwargs):
+        target = reference()
+        if target is None:
+            raise RuntimeError("LTXIdentityOverlap: the patched model no longer exists")
+        return function(target, *args, **kwargs)
+
+    return patched
+
+
+def _install_patches(ltxv):
+    if getattr(ltxv, "_id_overlap_patched", False):
+        return
+    orig_process_input = _unbound(ltxv, "_process_input")
+    orig_prepare_ts = _unbound(ltxv, "_prepare_timestep")
+    orig_prepare_pe = _unbound(ltxv, "_prepare_positional_embeddings")
+    orig_process_output = _unbound(ltxv, "_process_output")
+    orig_forward_internal = _unbound(ltxv, "_forward")
+
+    if orig_forward_internal is not None:
+        def _forward_capture_fps(self, x, timestep, context, attention_mask, frame_rate=25,
+                                  transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs):
+            # _forward calls _process_input BEFORE _prepare_positional_embeddings (the only
+            # other place frame_rate normally reaches) -- process_input needs it EARLIER, to
+            # convert the seconds-scale STRATA_SLOT_WIDTH into this step's raw pixel/frame
+            # units. Stash here so it's always current, never a step behind.
+            self._id_frame_rate = float(frame_rate)
+            return orig_forward_internal(
+                self, x, timestep, context, attention_mask, frame_rate=frame_rate,
+                transformer_options=transformer_options, keyframe_idxs=keyframe_idxs,
+                denoise_mask=denoise_mask, **kwargs,
+            )
+        ltxv._forward = _bind_weak(_forward_capture_fps, ltxv)
+
+    def process_input(self, x, keyframe_idxs, denoise_mask, **kw):
+        # Reset per-forward state first so a stale value from a previous run can never leak
+        # into this forward (e.g. if ref specs stop arriving after a Comfy update).
+        self._id_ref_len = 0
+        self._id_blocks = []
+        out = orig_process_input(self, x, keyframe_idxs, denoise_mask, **kw)
+        ref_specs = kw.get("_id_ref_specs")
+        if ref_specs is None:
+            ref_specs = (kw.get("transformer_options") or {}).get("_id_ref_specs")
+        if not ref_specs:
+            return out
+        try:
+            from comfy.ldm.lightricks.model import latent_to_pixel_coords
+            xx, pix, add = out
+            is_av = isinstance(xx, (list, tuple))
+            vx = xx[0] if is_av else xx
+            vco = pix[0] if is_av else pix
+            target_len = vx.shape[1]
+            self._id_target_len = target_len
+            frame_rate = float(getattr(self, "_id_frame_rate", 25.0))
+            # Raw pixel/frame units (pre frame_rate-division -- that happens later inside
+            # _prepare_positional_embeddings) -- convert to seconds only for the strata math,
+            # then back, since STRATA_SLOT_WIDTH is calibrated in seconds on the trainer side.
+            target_max_t_raw = float(vco[:, 0, :].amax().item())
+            _dbg("process_input IN: is_av", is_av, "| vx", _shape(vx), "| vco", _shape(vco),
+                 "| n_refs", len(ref_specs), "| frame_rate", frame_rate)
+            blocks = []  # (start, length, seg_value) per ref, in concatenation order
+            offset = target_len
+            for spec in ref_specs:
+                ref_lat = spec["latent"]
+                rt, rlc = self.patchifier.patchify(ref_lat.to(dtype=vx.dtype, device=vx.device))
+                rpc = latent_to_pixel_coords(latent_coords=rlc, scale_factors=self.vae_scale_factors,
+                                             causal_fix=self.causal_temporal_positioning)
+                # downscale_factor: this ref was VAE-encoded at target_size/downscale_factor,
+                # so its raw pixel-coords only span that smaller extent. Multiply the H/W axes
+                # back up by downscale_factor to re-stretch them across the target's actual
+                # coordinate range (fewer tokens, same spatial span) -- mirrors ltx_core's
+                # VideoConditionByReferenceLatent.apply_to (positions[:,1:3,...] *= downscale_factor).
+                dsf = spec.get("downscale_factor", 1)
+                if dsf != 1:
+                    rpc = rpc.clone()
+                    rpc[:, 1, ...] *= dsf
+                    rpc[:, 2, ...] *= dsf
+                strata_start_raw = None
+                if spec["layout"] == "strata":
+                    slot = int(spec["strata_slot"])
+                    strata_start_sec = target_max_t_raw / frame_rate + (slot + 1) * STRATA_SLOT_WIDTH
+                    strata_start_raw = strata_start_sec * frame_rate
+                rpc = _apply_tass_layout(
+                    rpc, vco, spec["layout"], strata_start=strata_start_raw,
+                    sidecar_margin_pixels=spec.get("sidecar_margin_pixels", 0.0),
+                    use_middle_indices_grid=bool(getattr(self, "use_middle_indices_grid", False)),
+                )
+                # Appearance references may be placed before frame zero to reduce the learned
+                # overlap frame-0 copy/leak. Old/external specs without this key retain offset 0.
+                # The shift is applied AFTER layout placement so it remains explicit for every
+                # supported layout; guide/mask specs opt into 0 in LTX Multiple Controls.
+                rpc = shift_reference_temporal_positions(
+                    rpc,
+                    spec.get("temporal_offset_latents", 0),
+                    self.vae_scale_factors[0],
+                )
+                # Learned per-slot tag, added in FEATURE space on the raw patchified tokens --
+                # i.e. before patchify_proj, exactly where the trainer adds it (the model's
+                # input projection is applied after). Specs without the key are unaffected.
+                slot_vector = spec.get("slot_vector")
+                if slot_vector is not None:
+                    rt = rt + slot_vector.to(device=rt.device, dtype=rt.dtype)
+                rt = self.patchify_proj(rt)
+                if rt.shape[0] != vx.shape[0]:
+                    rt = rt.expand(vx.shape[0], -1, -1)
+                if rpc.shape[0] != vco.shape[0]:
+                    rpc = rpc.expand(vco.shape[0], *([-1] * (rpc.dim() - 1)))
+                rlen = rt.shape[1]
+                vx = torch.cat([vx, rt], dim=1)
+                vco = torch.cat([vco, rpc.to(vco)], dim=2)
+                blocks.append((offset, rlen, float(spec["seg_value"])))
+                offset += rlen
+            ref_len = offset - target_len
+            self._id_ref_len = ref_len
+            self._id_blocks = blocks
+            add = dict(add); add["_id_ref_len"] = ref_len
+            _dbg("process_input OUT: blocks", blocks, "| target_len", target_len,
+                 "| vx", _shape(vx), "| vco", _shape(vco))
+            if is_av:
+                xx = [vx, xx[1]]; pix = [vco, pix[1]]
+            else:
+                xx, pix = vx, vco
+            return xx, pix, add
+        except Exception as e:
+            _dbg("ERROR process_input:", repr(e), "| out", _shape(out), "| n_refs", len(ref_specs) if ref_specs else 0)
+            raise
+
+    def prepare_timestep(self, timestep, batch_size, hidden_dtype, **kw):
+        # Give the ref tokens clean (0) timestep by editing the timestep INPUT before the
+        # model's per-frame compression/adaln (mirrors the audio-ref path in av_model).
+        # Use ONLY the instance attribute, not kw["_id_ref_len"] — when multi-angle patches
+        # are also installed, their process_input sets kw["_id_ref_len"] which we must NOT
+        # consume here (that would double-extend the timestep and cause shape mismatches).
+        ref_len = getattr(self, "_id_ref_len", 0)
+        if ref_len:
+            target_len = getattr(self, "_id_target_len", None)
+            if timestep.dim() <= 1 and target_len is not None:
+                timestep = timestep.view(-1, 1).expand(batch_size, target_len).contiguous()
+            if timestep.dim() >= 2 and target_len is not None:
+                cur = timestep.shape[1]
+                _gm0 = kw.get("grid_mask")
+                _full = _gm0.shape[-1] if (_gm0 is not None and hasattr(_gm0, "shape")) else None
+                if _full is not None and cur == _full:
+                    # Per-token timestep spans the grid-mask domain (video + IC-LoRA guide
+                    # tokens, indexed later via timestep[:, grid_mask]). Do NOT trim — append
+                    # ref zeros and let the grid_mask pad below keep everything in lockstep.
+                    ref_ts = torch.zeros(batch_size, ref_len, *timestep.shape[2:], device=timestep.device, dtype=timestep.dtype)
+                    timestep = torch.cat([timestep, ref_ts], dim=1)
+                    _dbg("prepare_timestep: grid-domain cur", cur, "-> appended ref", ref_len)
+                elif cur > target_len + ref_len:
+                    _dbg("prepare_timestep: oversized", cur, "-> trimming to video-only", target_len)
+                    timestep = timestep[:, :target_len]
+                    cur = target_len
+                if (_full is None or timestep.shape[1] != _full + ref_len) and cur == target_len:
+                    ref_ts = torch.zeros(batch_size, ref_len, *timestep.shape[2:], device=timestep.device, dtype=timestep.dtype)
+                    timestep = torch.cat([timestep, ref_ts], dim=1)
+                    _dbg("prepare_timestep: ref_len", ref_len, "| timestep ->", _shape(timestep), "| target_len", target_len)
+                else:
+                    _dbg("prepare_timestep: skip (cur", cur, "!= target", target_len, ")")
+                # Guide nodes (IC-LoRA Guide / Director Guide, etc.) inject a grid_mask that
+                # FILTERS x tokens in _process_input (x = x[:, grid_mask]) and later indexes the
+                # timestep (timestep[:, grid_mask]). Our ref tokens are appended AFTER that
+                # filter, so extend the mask with True for them — keeps modulation and vx in
+                # lockstep (False would drop our clean timesteps and desync again).
+                gm = kw.get("grid_mask")
+                if gm is not None and hasattr(gm, "shape"):
+                    gap = timestep.shape[1] - gm.shape[-1]
+                    if 0 < gap <= ref_len:
+                        pad = torch.ones(*gm.shape[:-1], gap, dtype=gm.dtype, device=gm.device)
+                        kw = dict(kw); kw["grid_mask"] = torch.cat([gm, pad], dim=-1)
+                        _dbg("prepare_timestep: grid_mask extended by", gap)
+        return orig_prepare_ts(self, timestep, batch_size, hidden_dtype, **kw)
+
+    def prepare_pe(self, pixel_coords, frame_rate, x_dtype):
+        pe = orig_prepare_pe(self, pixel_coords, frame_rate, x_dtype)
+        blocks = getattr(self, "_id_blocks", [])
+        theta = getattr(self, "_id_rope_theta", 10000.0)
+        if not blocks:
+            return pe
+        try:
+            _dbg("prepare_pe IN: pe struct", _shape(pe), "| blocks", blocks)
+
+            def rot(v_pe):
+                for start, length, seg in blocks:
+                    v_pe = _rotate_ref_block(v_pe, start, length, seg, theta)
+                return v_pe
+
+            # av returns [(v_pe, av_cross_video), (a_pe, av_cross_audio)]; v_pe = (cos, sin, split).
+            if isinstance(pe, list) and len(pe) and isinstance(pe[0], (list, tuple)) and isinstance(pe[0][0], (list, tuple)):
+                v_pe, cross_v = pe[0][0], pe[0][1]
+                v_pe = rot(v_pe)
+                pe = [(v_pe, cross_v), pe[1]]
+            else:
+                pe = rot(pe)
+            return pe
+        except Exception as e:
+            _dbg("ERROR prepare_pe:", repr(e), "| pe", _shape(pe))
+            raise
+
+    def process_output(self, x, embedded_timestep, keyframe_idxs, **kw):
+        ref_len = getattr(self, "_id_ref_len", 0)
+        if ref_len:
+            try:
+                from comfy.ldm.lightricks.av_model import CompressedTimestep
+                _dbg("process_output IN: x", _shape(x), "| et", _shape(embedded_timestep), "| ref_len", ref_len)
+                # trim ref tokens from the video stream
+                if isinstance(x, (list, tuple)):
+                    x = [x[0][:, :x[0].shape[1] - ref_len], *x[1:]]
+                    import copy
+                    et_list = list(embedded_timestep) if isinstance(embedded_timestep, (list, tuple)) else [embedded_timestep]
+                    v_et = et_list[0]
+                    if isinstance(v_et, CompressedTimestep):
+                        # clone + edit slots directly (version-agnostic; some builds lack per_frame kwarg)
+                        ppf = max(1, getattr(v_et, "patches_per_frame", 1) or 1)
+                        n_ref_frames = max(1, ref_len // ppf)
+                        v_et2 = copy.copy(v_et)
+                        v_et2.data = v_et.data[:, : v_et.num_frames - n_ref_frames].contiguous()
+                        v_et2.num_frames = v_et.num_frames - n_ref_frames
+                        et_list[0] = v_et2
+                    elif hasattr(v_et, "shape") and v_et.dim() >= 2 and v_et.shape[1] > 1:
+                        et_list[0] = v_et[:, : v_et.shape[1] - ref_len]
+                    embedded_timestep = et_list
+                else:
+                    x = x[:, :x.shape[1] - ref_len]
+                    if hasattr(embedded_timestep, "shape") and embedded_timestep.dim() >= 2 and embedded_timestep.shape[1] > 1:
+                        embedded_timestep = embedded_timestep[:, : embedded_timestep.shape[1] - ref_len]
+                _dbg("process_output: trimmed -> x", _shape(x), "| et", _shape(embedded_timestep))
+            except Exception as e:
+                _dbg("ERROR process_output:", repr(e), "| x", _shape(x), "| et", _shape(embedded_timestep))
+                raise
+        return orig_process_output(self, x, embedded_timestep, keyframe_idxs, **kw)
+
+    ltxv._process_input = _bind_weak(process_input, ltxv)
+    ltxv._prepare_timestep = _bind_weak(prepare_timestep, ltxv)
+    ltxv._prepare_positional_embeddings = _bind_weak(prepare_pe, ltxv)
+    ltxv._process_output = _bind_weak(process_output, ltxv)
+    ltxv._id_overlap_patched = True
+    log.info("LTXIdentityOverlap patches installed on %s", type(ltxv).__name__)
+
+
+class XHLTXIdentityOverlap:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL", {
+                "tooltip": (
+                    "主模型（LTX-2.3 / 2.5 的本体），并且**已经挂上了对应的身份 LoRA**。\n"
+                    "⚠️ 不挂 LoRA 这个节点等于白跑：注入的参考 token 在模型里没人认。\n"
+                    "⚠️ 本节点是在这个模型实例上打 patch，所以后续节点要用本节点输出的 model，不能绕回去用加载器那个。"
+                ),
+            }),
+            "positive": ("CONDITIONING", {
+                "tooltip": "正向文本条件（CLIP 编码后的结果）。本节点会往它上面追加 ArcFace 身份投影 token 后原样输出。",
+            }),
+            "negative": ("CONDITIONING", {
+                "tooltip": "负向文本条件，和 positive 成对传入，同样会被本节点的 patch 处理后输出。",
+            }),
+            "vae": ("VAE", {
+                "tooltip": (
+                    "用来把参考图编码成 latent 的 VAE（LTX 的 Conv VAE）。\n"
+                    "参考图先经它编码，才作为 token 注入。没接就无法生成 ref_preview。"
+                ),
+            }),
+            "latent": ("LATENT", {
+                "tooltip": (
+                    "目标的空 latent（分辨率 / 帧数由它决定）。\n"
+                    "参考图会按这个 latent 的时间与空间范围来排版 —— 「参考图缩放方式」的三个选项就是围绕它算的。"
+                ),
+            }),
+            "reference_image": ("IMAGE", {
+                             "tooltip": "【参考图 👤】要复制进生成结果的对象 —— 物体 / 动物 / 角色 / 人物都行，"
+                                        "不限于脸。可以吃一个图批（用 ImageBatch 合并多张）：每张图各自成为一个"
+                                        "参考块，编号依次为 source_id、source_id+1、……（第 1 张用原值，第 2 张 +1）。"
+                                        "想要历史版的精确「第 0 帧」位置，把「参考时间偏移」设为 0。 | "
+                                        "REFERENCE IMAGE: any subject, not just a face. Accepts a BATCH -- each "
+                                        "image becomes its own ref block with source_id + its index. Set the "
+                                        "reference temporal offset to 0 for the exact historical frame-0 placement."}),
+            "source_id": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 8.0, "step": 1.0,
+                                    "tooltip": "【参考图相位编号 🔢】source_phase 段号，训练时用的是 2，保持 2 即可。"
+                                               "0 = 不启用相位。图批里第 2 张起依次 +1。 | "
+                                               "source_phase segment id (training used 2). 0 = no phase."}),
+            "phase_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1,
+                                      "tooltip": "【相位缩放 ⚖】相位编号的倍率，保持 1.0 不要动。 | "
+                                                 "Phase scale, keep 1.0."}),
+            "ref_resize_mode": (["① 按视频比例裁切 (match_target)",
+                                 "② 整图塞入·不裁切 (match_target_letterbox)",
+                                 "③ 按原图尺寸·易卡死 (native_resolution)"],
+                                {"default": "① 按视频比例裁切 (match_target)",
+                             "tooltip": "【✂ 参考图缩放方式 —— 残影就出在这里，看懂了就不踩坑】\n"
+                                        "① 按视频比例裁切 (match_target)：按成片宽高比从参考图中间裁一刀，再缩到成片尺寸。"
+                                        "老配方默认，但比例不匹配时「会悄悄裁掉中间以外的内容」——"
+                                        "比如 16:9 的成片 + 1:1 的头像，上下各砍 22%，头顶的发冠/头饰就没了，"
+                                        "模型找不到依据就会自己编 → 残影/幽灵。\n"
+                                        "② 整图塞入·不裁切 (match_target_letterbox)：同样缩到成片尺寸，"
+                                        "但「整图等比塞进去、余量补白边，一个像素都不裁」。比例不匹配时选它。"
+                                        "代价：白边在 overlap 布局下有轻微泄漏风险。\n"
+                                        "③ 按原图尺寸·易卡死 (native_resolution)：按参考图自身尺寸编码（32 对齐）。"
+                                        "⚠️ 8GB 显存实测会直接卡住不动 —— 除非你确知 LoRA 是按固定参考分辨率训练的，否则别碰。\n"
+                                        " | ① center-crop to video size (silently discards edges → causes ghosting). "
+                                        "② fit whole ref inside video size, pad white, never crops. "
+                                        "③ encode at ref's own size (can hang on 8GB)."}),
+
+            # 高亮：这一项决定"裁哪一刀"，只对模式 ① 生效
+            "debug_log": ("BOOLEAN", {"default": False,
+                          "tooltip": "【调试日志 🐞】往控制台打印每一步的 [LTXIdOverlap] 形状日志，"
+                                     "只有排查问题时才打开。 | Print per-step shape logs to console."}),
+        }, "optional": {
+            "crop_anchor": (["居中 (center)", "顶部 (top)", "底部 (bottom)", "左侧 (left)", "右侧 (right)"],
+                            {"default": "居中 (center)",
+                             "tooltip": "【📍 裁切位置】只在模式 ①「按视频比例裁切」下生效，决定「从哪一边开始裁」。"
+                                        "参考图和成片比例不匹配时才会有影响："
+                                        "想保住头顶的发冠/头饰选「顶部 (top)」，但会连下巴一起切掉；"
+                                        "想保住脸和脖子就用「居中 (center)」。"
+                                        "模式 ② ③ 根本不裁，这一项对它们无效。 | "
+                                        "Only used by match_target. Which part of the reference survives the crop: "
+                                        "'top' keeps the crown but cuts the chin; 'center' is the default. "
+                                        "No effect on match_target_letterbox or native_resolution."}),
+            "layout": (["叠置布局 (overlap)", "全轴错开 (st_drc)", "分层槽位 (strata)", "侧挂 (sidecar)"],
+                       {"default": "叠置布局 (overlap)",
+                       "tooltip": "【🗂 布局方式 —— ⚠️ 必须和 LoRA 训练时用的一致】\n"
+                                  "叠置布局 (overlap)：参考块借用目标自身的 RoPE 坐标范围，再叠加独立的时间偏移；"
+                                  "时间偏移设 0 就是历史版的精确叠置网格。「本机当前 LoRA（Best_FaceID）就是用这个」。\n"
+                                  "全轴错开 (st_drc)：把整个参考块在 T/H/W 三个轴上都推到目标坐标范围之外（完全不重叠）。\n"
+                                  "分层槽位 (strata)：只在时间轴上推到目标长度之后的独立槽位（第 1 张→槽 0，第 2 张→槽 1……），"
+                                  "H/W 仍与目标重叠 —— 这是「堆叠参考图」配方（ltx_trainer TASS strata）。\n"
+                                  "侧挂 (sidecar)：参考块挂在旁侧区域。\n"
+                                  "🔴 选错不是「画质差一点」，而是模型从没学过的坐标约定 —— 锁脸会「完全失效」。"
+                                  "不确定时保持默认的叠置布局 (overlap)。 | The base positional layout used by the "
+                                  "checkpoint. Use whichever the checkpoint was actually trained with -- the wrong one "
+                                  "means identity transfer won't work at all."}),
+            "reference_guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1,
+                             "tooltip": "【🎯 参考引导强度】类似 ST-DRC 的参考图 CFG（arxiv 2606.02441）。\n"
+                                        "1.0 = 关闭（和没这个参数时完全一样）。\n"
+                                        "大于 1.0 时，每步会多跑一次「丢掉参考 token」的前向，把参考图自身的作用放大："
+                                        "denoised += (scale-1)*(有参考 - 无参考)，道理和 CFG 放大文本提示一样。"
+                                        "开启后每步多一次前向（这次不含参考 token，较便宜）。\n"
+                                        "串脸/脸不像时可以从 2~4 开始试；单位和采样器上的 CFG scale 一致。 | "
+                                        "ST-DRC-style reference-CFG. 1.0 = off; >1.0 amplifies the reference's own "
+                                        "contribution at the cost of one extra ref-free forward pass per step. "
+                                        "Start around 2-4."}),
+            # Appended last so saved workflows keep every historical widget index stable.
+            "reference_temporal_offset_latents": reference_temporal_offset_input(),
+        }}
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "debug", "ref_preview", "crop_overlay")
+    FUNCTION = "apply"
+    CATEGORY = "🔁XH/Identity"
+    DESCRIPTION = ("🔒XH-LTX锁脸 —— 通过模型 patch 把参考图作为独立 token 注入（不是 I2V），配合 "
+                   "overlap / st_drc / strata + source_phase 参考条件。参考图可以是任何对象，不限于脸。\n"
+                   "⚠️ 必须先把对应 LoRA 接在 MODEL 上。\n"
+                   "输出 ref_preview = 模型实际拿到的参考图；crop_overlay = 模式①下保留区域的绿框"
+                   "（框外就是被裁掉丢掉的部分）。\n"
+                   "本节点是 bfsnodes 同类节点的 XH 复刻版：算法完全一致，只做了界面中文与分类改名。 | "
+                   "Reference conditioning via a model patch (separate tokens, NOT I2V). Load the LoRA on MODEL "
+                   "first. ref_preview shows what actually gets encoded; crop_overlay shows what survives the crop.")
+
+    def apply(self, model, positive, negative, vae, latent, reference_image,
+              reference_temporal_offset_latents=DEFAULT_REFERENCE_TEMPORAL_OFFSET_LATENTS,
+              source_id=2.0, phase_scale=1.0,
+              ref_resize_mode="match_target", debug_log=False,
+              crop_anchor="center", layout="overlap", reference_guidance_scale=1.0):
+        import comfy.samplers
+        import comfy.utils
+
+        # 🔁XH：把「中文 (english)」双语选项值收敛回英文原值（旧存档的纯英文值原样通过）。
+        # 下面所有逻辑仍按英文原值判断，所以本节点与原版行为逐字节一致。
+        ref_resize_mode = _xh_norm(ref_resize_mode, _XH_REF_RESIZE_MODES)
+        crop_anchor = _xh_norm(crop_anchor, _XH_CROP_ANCHORS)
+        layout = _xh_norm(layout, _XH_LAYOUTS)
+
+        global _DEBUG_ENABLED
+        _DEBUG_ENABLED = bool(debug_log)
+        m = model.clone()
+        ltxv = _find_ltxv(m)
+        detected_ltx_version = _detect_ltx_version(ltxv)
+
+        _, w_sf, h_sf = vae.downscale_index_formula
+        n_refs = reference_image.shape[0]
+
+        def _encode_one(img1):
+            """Resize (per ref_resize_mode/crop_anchor) + VAE-encode ONE reference image
+            ([1,H,W,C] slice). Byte-identical to the pre-batch code path when n_refs == 1."""
+            if ref_resize_mode == "native_resolution":
+                # Encode at the ref image's OWN resolution (rounded to nearest 32px),
+                # independent of the output video size -- matches training when the ref used
+                # a fixed/own bucket.
+                _, src_h, src_w, _ = img1.shape
+                tgt_w = max(w_sf, round(src_w / w_sf) * w_sf)
+                tgt_h = max(h_sf, round(src_h / h_sf) * h_sf)
+            else:
+                # Legacy behavior: resize ref to match the target video's pixel size (correct
+                # for recipes where the ref used the SAME resolution bucket as the video, e.g.
+                # a small face crop -- resolution never mattered there).
+                _, _, _, lat_h, lat_w = latent["samples"].shape
+                tgt_w, tgt_h = lat_w * w_sf, lat_h * h_sf
+            _, src_h0, src_w0, _ = img1.shape
+            crop_box = (0, 0, src_w0, src_h0)  # default: "nothing cropped" (letterbox/native modes)
+            if ref_resize_mode == "match_target_letterbox":
+                ref_px = _letterbox_resize(img1, tgt_w, tgt_h)[:1, :, :, :3]
+            elif ref_resize_mode == "match_target" and crop_anchor != "center":
+                # non-default anchor: use the configurable-anchor crop (new in v1.10.13)
+                ref_px, crop_box = _anchored_crop_resize(img1, tgt_w, tgt_h, anchor=crop_anchor)
+                ref_px = ref_px[:1, :, :, :3]
+            else:
+                # unchanged from before v1.10.13 -- exact original center-crop path, byte-identical
+                ref_px = comfy.utils.common_upscale(img1.movedim(-1, 1), tgt_w, tgt_h, "bilinear", "center").movedim(1, -1)[:1, :, :, :3]
+                if ref_resize_mode == "match_target":
+                    _, crop_box = _anchored_crop_resize(img1, tgt_w, tgt_h, anchor="center")  # for the preview overlay only
+            ref_lat = vae.encode(ref_px)
+            overlay = _draw_crop_overlay(img1[:1], crop_box)
+            return ref_lat, ref_px.clone(), overlay, crop_box, src_w0, src_h0
+
+        ref_specs, ref_previews, crop_overlays = [], [], []
+        for i in range(n_refs):
+            ref_lat_i, ref_px_i, overlay_i, crop_box, src_w0, src_h0 = _encode_one(reference_image[i:i + 1])
+            ref_specs.append({"latent": ref_lat_i, "seg_value": (float(source_id) + i) * float(phase_scale),
+                              "layout": layout, "strata_slot": i,
+                              "temporal_offset_latents": int(reference_temporal_offset_latents)})
+            ref_previews.append(ref_px_i)
+            crop_overlays.append(overlay_i)
+        ref_lat = ref_specs[0]["latent"]  # for the debug string below (1st ref's shape)
+        ref_preview = torch.cat(ref_previews, dim=0)
+        crop_overlay = torch.cat(crop_overlays, dim=0)
+
+        _install_patches(ltxv)
+        ltxv._id_rope_theta = 10000.0
+        m.model_options = dict(m.model_options)
+        to = dict(m.model_options.get("transformer_options", {}))
+        to["_id_ref_specs"] = ref_specs
+        m.model_options["transformer_options"] = to
+
+        if reference_guidance_scale != 1.0:
+            # ST-DRC reference-CFG: a third forward pass per step with the reference tokens
+            # dropped isolates the reference's own contribution, the same way CFG isolates
+            # the text prompt's (arxiv 2606.02441). `args["input_cond"]` is the exact
+            # conditioning list KSampler passed for the positive/"cond" branch (same prompt,
+            # same batching) -- reuse it unchanged, only strip `_id_ref_specs` from the
+            # model_options used for THIS extra call so process_input sees no reference.
+            noref_to = dict(to)
+            noref_to.pop("_id_ref_specs", None)
+            ref_scale = float(reference_guidance_scale)
+
+            # NOTE: must take exactly ONE parameter -- set_model_sampler_cfg_function()
+            # inspects the signature's parameter COUNT (regardless of defaults) and treats
+            # anything with 3 params as the legacy (cond, uncond, cond_scale) calling
+            # convention, silently passing those three tensors/floats positionally instead
+            # of the `args` dict. Keep noref_to/ref_scale as plain closure vars, not defaults.
+            def _ref_cfg_function(args):
+                cond = args["cond"]
+                uncond = args["uncond"]
+                cond_scale = args["cond_scale"]
+                denoised = uncond + (cond - uncond) * cond_scale
+                noref_model_options = dict(args["model_options"])
+                noref_model_options["transformer_options"] = noref_to
+                (noref_pred,) = comfy.samplers.calc_cond_batch(
+                    args["model"], [args["input_cond"]], args["input"], args["timestep"], noref_model_options,
+                )
+                noref_denoised = args["input"] - noref_pred
+                denoised = denoised + (ref_scale - 1.0) * (cond - noref_denoised)
+                return denoised
+
+            m.set_model_sampler_cfg_function(_ref_cfg_function, disable_cfg1_optimization=True)
+
+        seg_list = ", ".join(f"#{i}={s['seg_value']:g}" for i, s in enumerate(ref_specs))
+        temporal_pixel_offset = reference_temporal_pixel_offset(
+            reference_temporal_offset_latents,
+            vae.downscale_index_formula[0],
+        )
+        dbg = (
+            "=== LTX Identity OVERLAP (exact) ===\n"
+            f"detected model: LTX-{detected_ltx_version} "
+            f"(architecture detection via keyframes_abs_pos_embedding)\n"
+            f"references: {n_refs} (encoded at {ref_preview.shape[2]}x{ref_preview.shape[1]}px each, "
+            f"mode={ref_resize_mode}{f', crop_anchor={crop_anchor}' if ref_resize_mode == 'match_target' else ''}) "
+            f"-> {layout} tokens, source_phase seg per ref: {seg_list}\n"
+            f"reference temporal offset: {int(reference_temporal_offset_latents)} latent step(s) "
+            f"= {temporal_pixel_offset} pixel frame(s) (reference only)\n"
+            f"patches on {type(ltxv).__name__}: process_input/prepare_timestep/prepare_pe/process_output\n"
+            f"crop preview: kept region {crop_box[2]}x{crop_box[3]}px of the {src_w0}x{src_h0}px reference "
+            "-- see the ref_preview/crop_overlay IMAGE outputs to inspect what gets kept vs discarded.\n"
+            f"reference-CFG: {'off' if reference_guidance_scale == 1.0 else f'ON, scale={reference_guidance_scale} (+1 forward pass/step)'}\n"
+            "Set LTX_IDOVERLAP_DEBUG=1 for per-step shape logs. Connect negative + CFG 3-5, no LightX2V."
+        )
+        log.info("\n" + dbg)
+        # pass the latent through unchanged (the ref is injected inside the model, not here)
+        # so the graph can chain Empty -> this node -> sampler without branching.
+        return (m, positive, negative, latent, dbg, ref_preview, crop_overlay)
+
+
+# 🔁XH-LTX锁脸：class_type 键换成 XH 自己的，与 bfsnodes 原版互不干扰、可同时安装。
+# ⚠️ 键与原版不同，所以引用旧键的存档会把本节点显示成「缺失」——手动替换一次即可。
+NODE_CLASS_MAPPINGS = {
+    "XHLTXIdentityOverlap": XHLTXIdentityOverlap,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "XHLTXIdentityOverlap": "🔒XH-LTX锁脸",
+}

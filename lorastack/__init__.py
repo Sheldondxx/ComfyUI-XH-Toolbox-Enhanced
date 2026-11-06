@@ -1,0 +1,28 @@
+from .py.core import (
+    XHPowerLoraStack,
+    CATEGORY_TYPE,
+    NODE_CLASS_NAME,
+    DISPLAY_NAME,
+    XHPureLoraStack,
+    NODE_CLASS_NAME_PURE,
+    DISPLAY_NAME_PURE,
+)
+
+WEB_DIRECTORY = "web"
+
+NODE_CLASS_MAPPINGS = {
+    NODE_CLASS_NAME: XHPowerLoraStack,
+    # 2026-10-02 新增：纯 LoRA 堆栈（只有 MODEL 口，不碰 CLIP）
+    NODE_CLASS_NAME_PURE: XHPureLoraStack,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    NODE_CLASS_NAME: DISPLAY_NAME,
+    NODE_CLASS_NAME_PURE: DISPLAY_NAME_PURE,
+}
+
+__all__ = [
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+    "WEB_DIRECTORY",
+]

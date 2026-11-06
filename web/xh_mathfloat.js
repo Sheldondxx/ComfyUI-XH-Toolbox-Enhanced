@@ -1,0 +1,155 @@
+// 🔁XH-浮点运算 · 家族前端
+// ① 中/EN 切换：节点标题 + 参数控件标签 + 输入/输出端口名（照 xh_counter.js 规范）
+// ② 下拉框「操作」显示中文，但**存档值仍是英文**（走官方 options.getOptionLabel，函数不进 JSON）
+// ③ 节点自身配色 🎨（XH 家族 12 色 + 自定义取色器）
+// ④ onConfigure 里做 widgets_values 自愈（切工作流重载防错位）
+//
+// 铁律：只改 label / title，绝不改 name；绝不改 COMBO 的 values；DOM 工具栏 serialize:false 且只 append。
+const { app } = window.comfyAPI.app;
+
+import { ensureLangBridge, makeXHToolbar, onLangChanged, releaseButtons, fixWidgetValuesFromSaved } from "./xh_ui_kit.js";
+
+ensureLangBridge();
+const NODE_TYPE = "XHMathFloat";
+const XH_I18N = {
+    zh: {
+        nodes: { XHMathFloat: "🔁XH-浮点运算" },
+        widgets: { a: "a", b: "b", operation: "操作" },
+        // a/b 是多类型输入（FLOAT,INT,BOOLEAN）⇒ 前端按「端口」渲染，标签走 slots 表才生效（与 xh_lang_audit 口径一致）
+        slots: { FLOAT: "浮点数", a: "a", b: "b" },
+    },
+    en: {
+        nodes: { XHMathFloat: "XH Float Math" },
+        widgets: { a: "a", b: "b", operation: "operation" },
+        slots: { FLOAT: "FLOAT", a: "a", b: "b" },
+    },
+};
+
+function t(lang, kind, key) {
+    const pack = XH_I18N[lang] || XH_I18N.zh;
+    return (pack[kind] && pack[kind][key]) || null;
+}
+
+// ---- 下拉「操作」显示中文（只改显示，value 保持英文：add / multiply …）----
+const VALUE_LABELS = {
+    add: "加",
+    subtract: "减",
+    multiply: "乘",
+    divide: "除（真除法）",
+    modulo: "取余",
+    power: "幂",
+};
+
+function applyComboValueLabels(node, lang) {
+    if (!node || !node.widgets) return;
+    const zh = (lang || window.XH_LANG || "zh") === "zh";
+    for (const w of node.widgets) {
+        if (!w || w.type !== "combo" || !w.options) continue;
+        if (zh) {
+            w.options.getOptionLabel = (v) => {
+                if (v == null) return "";
+                return VALUE_LABELS[String(v)] || String(v);
+            };
+        } else {
+            delete w.options.getOptionLabel;
+        }
+    }
+    try { node.setDirtyCanvas?.(true, true); } catch (e) {}
+}
+
+function applyLang(node, lang) {
+    if (!node) return;
+    lang = lang || window.XH_LANG || "zh";
+    try {
+        const want = t(lang, "nodes", NODE_TYPE);
+        const zhT = XH_I18N.zh.nodes[NODE_TYPE];
+        const enT = XH_I18N.en.nodes[NODE_TYPE];
+        if (want && (!node.title || node.title === zhT || node.title === enT)) node.title = want;
+
+        if (node.widgets) {
+            for (const w of node.widgets) {
+                if (!w || !w.name) continue;
+                const lb = t(lang, "widgets", w.name);
+                if (lb) w.label = lb;
+            }
+        }
+        applyComboValueLabels(node, lang);
+
+        const applySlots = (arr) => {
+            if (!arr) return;
+            for (const s of arr) {
+                const lb = t(lang, "slots", s && s.name);
+                if (lb) s.label = lb;
+            }
+        };
+        applySlots(node.inputs);
+        applySlots(node.outputs);
+
+        try {
+            node.graph?.trigger?.("node:slot-label:changed", { nodeId: node.id, slotType: 1 });
+            node.graph?.trigger?.("node:slot-label:changed", { nodeId: node.id, slotType: 2 });
+        } catch (e) {}
+        try { node.setDirtyCanvas?.(true, true); } catch (e) {}
+    } catch (e) {
+        console.warn("[XH MathFloat Lang] 应用语言失败:", e);
+    }
+}
+
+function nodesOfType() {
+    try {
+        return (app.graph?.nodes || app.graph?._nodes || []).filter((n) => n.type === NODE_TYPE);
+    } catch (e) { return []; }
+}
+function applyLangToAll() {
+    const lang = window.XH_LANG || "zh";
+    for (const n of nodesOfType()) applyLang(n, lang);
+    try { app.graph?.setDirtyCanvas?.(true, true); } catch (e) {}
+}
+
+
+app.registerExtension({
+    name: "XH.MathFloat",
+
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== NODE_TYPE) return;
+
+        const origOnCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            const r = origOnCreated?.apply(this, arguments);
+            try {
+                // 标准工具条（中/EN + 🎨）—— 家族唯一实现见 web/xh_ui_kit.js
+                const { bar, langBtn, colorBtn } = makeXHToolbar(this, { widgetName: "xh_mathfloat_bar" });
+                this._xhLangBtn = langBtn;
+
+                applyLang(this);
+            } catch (e) {
+                console.warn("[XH MathFloat] 工具栏创建失败:", e);
+            }
+            return r;
+        };
+
+        // 🔴 切工作流重载时纠偏 widgets_values（工具条占位残留 / 顺序错位 ⇒ COMBO 变红变数字）
+        const origOnConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            const r = origOnConfigure?.apply(this, arguments);
+            try {
+                fixWidgetValuesFromSaved(this, arguments[0]);
+                applyLang(this);
+            } catch (e) {
+                console.warn("[XH MathFloat] onConfigure 自愈失败:", e);
+            }
+            return r;
+        };
+
+        const origOnRemoved = nodeType.prototype.onRemoved;
+        nodeType.prototype.onRemoved = function () {
+            releaseButtons(this);
+            return origOnRemoved?.apply(this, arguments);
+        };
+    },
+
+    async setup() {
+        // 语言变更 + 工作流载入重刷 —— 统一走 kit（等价实现，见 web/xh_ui_kit.js）
+        onLangChanged(() => applyLangToAll());
+    },
+});

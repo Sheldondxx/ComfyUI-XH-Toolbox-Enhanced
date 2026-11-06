@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-xh-toolbox"
+version = "1.17.5"
+description = "🔧 Comfyui-XH_Toolbox —— XH 节点合集（77 个节点 / 18 个模块）：H3低显存、图像工具（含去背景/图像对比拼图）、H3→LTX2.5 适配、LTX锁脸、衔接淡化/接缝修正、链提示词选择器/动态提示词联结、MSR精修编码（分段稿段尾写时长，LTX二采防串味）、分组控制/循环/分段表/标签/计时器/布尔开关/种子/整数运算/浮点运算、人声分离、LoRA堆栈、滑块、Set/Get（单路+多路，走官方虚拟节点内核，与KJNodes互通）、工具扩展（表达式求值/形状遮罩覆盖/区域限定框/智能遮脸）、声音播放、宫格故事板（宫格底板/图像对比度/宫格切图）、加载视频（复刻 VHS，零新增依赖，带内嵌播放器+预览开关）、加载音频（复刻官方 Load Audio，输出逐字一致可互换，前端粗时间线播放器：10px 轨道+16px 拖把手拖拽 seek + 实时频谱律动条（Web Audio AnalyserNode 32 根竖条随音乐跳动 + 峰值帽） + 📂 文件夹模式与循环轮次索引（接 XH-循环零接线逐段换音频，start_index 有接线以它为准）、H3 latent接续（接缝 latent 锚定 + Drift-Control，XH 自研净室实现零三方依赖）、H3 动作校正（TST 推理时注意力校正，arXiv:2609.08505·MIT，XH 自研 H3 移植，MODEL→MODEL 零第三方依赖）"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.comfy]
+PublisherId = "xh666"
+DisplayName = "Comfyui-XH_Toolbox"
+Icon = ""
+
+# ⚠️ 刻意【不】在这里写 web = "web"：
+# 本包已用 __init__.py 的 WEB_DIRECTORY = "web" 注册前端扩展。
+# 两处同时声明会让 ComfyUI 用两个不同的键注册同一个目录，js 有被加载两次的风险。

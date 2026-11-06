@@ -1,0 +1,45 @@
+# ============================================================
+#  Comfyui-XH_Toolbox  外部依赖
+# ------------------------------------------------------------
+#  这里只列【ComfyUI 官方 requirements.txt 里没有】的包。
+#  torch / torchvision / numpy / einops / safetensors / aiohttp /
+#  Pillow / transformers 等已包含在 ComfyUI 官方依赖中，不重复列。
+#
+#  ⚠ 下面 3 个是「硬依赖」：装不上的话，本包对应模块的节点会缺失
+#    （2026-10-05 起 __init__.py 已做逐个 try 容错加载：
+#     缺哪个包只少哪一块节点，其余节点照常可用，启动日志会点名说明缺什么）。
+#    装完要**重启** ComfyUI 才生效。
+#
+#  ComfyUI Manager 会自动读取本文件并在装包时提示安装
+#  （源码：comfyui_manager/common/unified_dep_resolver.py 逐包扫描 requirements.txt）。
+# ============================================================
+
+# 【硬依赖】seam_correct（接缝校正）抽帧找接缝 + ltx_identity（锁脸）用
+opencv-python
+
+# 【硬依赖】seam_correct（接缝校正）场景切分用
+#   注意：pip 包名是 scenedetect，不是 PySceneDetect
+scenedetect
+
+# 【硬依赖】audiosep（人声分离）模型用
+rotary-embedding-torch
+
+# ------------------------------------------------------------
+# 以下【故意不放进自动安装】—— 不装也能正常启动，
+# 只有用到对应节点/选项时才需要，避免给所有人白装：
+#
+#   torchaudio   → audiosep（人声分离）必需。
+#                  NVIDIA 用户随官方 requirements-nvidia.txt 已自带；
+#                  CPU / AMD 用户请按 PyTorch 官方指引装与 torch 同版本的
+#                  torchaudio —— 直接 `pip install torchaudio` 可能重装 torch，
+#                  有破坏 CUDA 环境的风险，所以不写进自动安装。
+#
+#   insightface   → 仅「🔒XH-LTX锁脸」节点需要（pip install insightface）。
+#                  另需 ArcFace buffalo_l 模型（首次运行自动下载，
+#                  放在 models\insightface\）。
+#
+#   nvidia-vfx    → 仅图像缩放的「nvidia_rtx_vsr」选项需要。
+#                  需 NVIDIA VFX SDK，请从 NVIDIA 官方渠道获取
+#                  （公网 PyPI 上的同名包只有 3.7KB 的 sdist，
+#                    安装前先确认来源，别在公共源上乱装）。
+# ------------------------------------------------------------
